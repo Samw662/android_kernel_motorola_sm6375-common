@@ -490,6 +490,7 @@ LINUXINCLUDE    := \
 		-I$(objtree)/arch/$(SRCARCH)/include/generated \
 		$(if $(building_out_of_srctree),-I$(srctree)/include) \
 		-I$(objtree)/include \
+		-I$(objtree)/security/selinux \
 		$(USERINCLUDE)
 
 KBUILD_AFLAGS   := -D__ASSEMBLY__ -fno-PIE
@@ -1887,6 +1888,12 @@ $(build-dirs): prepare
 	$(Q)$(MAKE) $(build)=$@ \
 	single-build=$(if $(filter-out $@/, $(single-no-ko)),1) \
 	need-builtin=1 need-modorder=1
+
+# KernelSU (built under drivers/) consumes generated SELinux headers
+# (flask.h, av_permissions.h) that security/selinux emits into the
+# objtree. Build security/ first so those headers exist before drivers/
+# compiles, otherwise clean parallel builds fail with flask.h not found.
+drivers: security
 
 clean-dirs := $(addprefix _clean_, $(clean-dirs))
 PHONY += $(clean-dirs) clean
