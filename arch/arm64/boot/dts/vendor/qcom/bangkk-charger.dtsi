@@ -69,6 +69,7 @@
 	qcom,dcp-curr-max = <2000000>;
 	qcom,hvdcp2-max-icl-ua = <2000000>;
 	qcom,hvdcp-disable;
+	qcom,force-pd-enable;
 	qcom,otg-cl-ua = <1000000>;
 	qcom,thermal-mitigation = <3000000 2500000
 			2000000 1500000
