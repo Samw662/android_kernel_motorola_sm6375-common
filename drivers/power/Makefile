@@ -10,6 +10,7 @@ obj-$(CONFIG_CPS_WLS_CHARGER)	+= cps4019_wls_charger/
 obj-$(CONFIG_CW2217B_FG_MMI)	+= cw2217b_fg_mmi/
 obj-$(CONFIG_MMI_CHARGER)	+= mmi_charger/
 obj-$(CONFIG_MMI_DISCRETE_CHARGER)	+= mmi_discrete_charger/
+obj-$(CONFIG_MMI_DISCRETE_CHARGER_CLASS)	+= mmi_discrete_charger/
 obj-$(CONFIG_MMI_DISCRETE_TURBO_CHARGER)	+= mmi_discrete_turbo_charger/
 obj-$(CONFIG_MMI_PARALLEL_CHARGER_IIO)	+= mmi_parallel_charger_iio/
 obj-$(CONFIG_MMI_SMBCHARGER_IIO)	+= mmi-smbcharger-iio/
