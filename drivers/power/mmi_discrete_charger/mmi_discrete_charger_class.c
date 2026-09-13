@@ -363,7 +363,7 @@ static int charger_match_device_by_name(struct device *dev,
 	return strcmp(dev_name(dev), name) == 0;
 }
 
-struct charger_device *get_charger_by_name(const char *name)
+__weak struct charger_device *get_charger_by_name(const char *name)
 {
 	struct device *dev;
 
@@ -375,7 +375,6 @@ struct charger_device *get_charger_by_name(const char *name)
 	return dev ? to_charger_device(dev) : NULL;
 
 }
-EXPORT_SYMBOL(get_charger_by_name);
 
 static ssize_t name_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
