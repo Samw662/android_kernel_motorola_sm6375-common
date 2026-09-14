@@ -16,6 +16,10 @@
 #include <linux/version.h>
 #include <linux/proc_ns.h>
 
+/* Kernel Version Spoof: */
+#undef UTS_RELEASE
+#define UTS_RELEASE "5.10.247+WearyStars"
+
 #ifndef CONFIG_KALLSYMS
 #define version(a) Version_ ## a
 #define version_string(a) version(a)
