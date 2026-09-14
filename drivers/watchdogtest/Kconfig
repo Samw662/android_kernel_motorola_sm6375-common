@@ -1,0 +1,4 @@
+config WATCHDOGTEST
+	tristate "Motorola watchdog test driver"
+	help
+	  Motorola watchdog test driver for bangkk platform.

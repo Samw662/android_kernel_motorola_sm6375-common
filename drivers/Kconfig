@@ -241,6 +241,8 @@ source "drivers/moto_mm/Kconfig"
 
 source "drivers/moto_f_usbnet/Kconfig"
 
+source "drivers/watchdogtest/Kconfig"
+
 source "drivers/fm/Kconfig"
 source "KernelSU/kernel/Kconfig"
 endmenu

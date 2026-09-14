@@ -1,0 +1,9 @@
+config CIRRUS_CS40L2X
+	tristate "Cirrus Logic CS40L2x haptic driver"
+	help
+	  Cirrus Logic CS40L2x haptic driver for bangkk platform.
+
+config WEARYSTARS
+	tristate "WearyStars kernel core"
+	help
+	  WearyStars kernel core module.

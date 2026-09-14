@@ -3,14 +3,14 @@ EXTRA_CFLAGS += -Wall
 EXTRA_CFLAGS += -I$(TOP)/motorola/kernel/modules/include
 
 cirrus_cs40l2x-objs = cs40l2x.o cs40l2x-tables.o
-obj-y += cirrus_cs40l2x.o
+obj-$(CONFIG_CIRRUS_CS40L2X) += cirrus_cs40l2x.o
 
 obj-$(CONFIG_QSEECOM)           += qseecom-mod.o
 qseecom-mod-y                   := qseecom.o
 qseecom-mod-$(CONFIG_COMPAT)    += compat_qseecom.o
 obj-$(CONFIG_MMI_SYS_TEMP)      += mmi_sys_temp/
 obj-$(CONFIG_UTAG) 		+= utag/
-obj-m 				+= ldo_vibrator_mmi/
+obj-$(CONFIG_LDO_VIBRATOR_MMI)	+= ldo_vibrator_mmi/
 obj-$(CONFIG_AWINIC_SAR)        += awinic/
 obj-$(CONFIG_SX937X_SAR)        += sx937x/
-obj-y                           += wearystars.o
+obj-$(CONFIG_WEARYSTARS)       += wearystars.o

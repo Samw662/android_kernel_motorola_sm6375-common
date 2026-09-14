@@ -8,5 +8,5 @@ endif
 
 ldo_vibrator_mmi-y += moto_ldo_vibrator.o
 
-obj-y += ldo_vibrator_mmi.o
+obj-$(CONFIG_LDO_VIBRATOR_MMI) += ldo_vibrator_mmi.o
 
