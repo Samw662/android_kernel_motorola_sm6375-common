@@ -1,5 +1,12 @@
+config FM_CTRL
+	tristate "FM Radio Controller"
+	default m
+	help
+	  Enable FM radio controller support.
+
 config RADIO_ELNA
 	tristate "ELNA FM Radio"
 	default n
+	depends on FM_CTRL
 	help
 	  Choose Y here if you have this FM radio chip.
