@@ -17026,6 +17026,11 @@ static int __maybe_unused wlan_hdd_state_ctrl_param_create(void)
 	int ret;
 	struct device *dev;
 
+	if (class) {
+		pr_info("wlan_hdd_state already initialized, skipping");
+		return 0;
+	}
+
 	init_completion(&wlan_start_comp);
 	qdf_atomic_init(&wlan_hdd_state_fops_ref);
 
