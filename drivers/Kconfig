@@ -242,5 +242,8 @@ source "drivers/moto_mm/Kconfig"
 source "drivers/moto_f_usbnet/Kconfig"
 
 source "drivers/fm/Kconfig"
+source "techpack/datarmnet/core/Kconfig"
+source "techpack/datarmnet-ext/offload/Kconfig"
+source "techpack/datarmnet-ext/shs/Kconfig"
 source "KernelSU/kernel/Kconfig"
 endmenu

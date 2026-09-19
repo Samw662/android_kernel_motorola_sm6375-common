@@ -1,1 +1,1 @@
-obj-y += core/
+obj-$(CONFIG_RMNET_CORE) += core/
