@@ -44,7 +44,7 @@
 static unsigned int g_aw882xx_dev_cnt = 0;
 static unsigned int g_print_dbg = 0;
 static unsigned int g_algo_rx_en = false;
-static unsigned int g_algo_tx_en = false;
+static unsigned int __maybe_unused g_algo_tx_en = false;
 static unsigned int g_algo_copp_en = false;
 #ifdef AW_SPIN_ENABLE
 static unsigned int g_spin_value = 0;
