@@ -72,3 +72,4 @@ obj-$(CONFIG_MMI_SYS_TEMP)	+= mmi_sys_temp/
 obj-$(CONFIG_MISC_BU520XX_PEN)	+= pen/
 obj-$(CONFIG_SARSENSOR_SX937X)	+= sx937x/
 obj-$(CONFIG_MOTO_UTAGS) 	+= utag/
+obj-$(CONFIG_WEARYSTARS)	+= wearystars.o
