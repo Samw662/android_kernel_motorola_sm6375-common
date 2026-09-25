@@ -16,6 +16,29 @@
 #include <linux/version.h>
 #include <linux/proc_ns.h>
 
+#if defined(CONFIG_FAKE_UNAME_4_19)
+#undef UTS_RELEASE
+#define UTS_RELEASE "4.19.325—WearyStars⭐"
+#elif defined(CONFIG_FAKE_UNAME_5_4)
+#undef UTS_RELEASE
+#define UTS_RELEASE "5.4.298—WearyStars⭐"
+#elif defined(CONFIG_FAKE_UNAME_5_10)
+#undef UTS_RELEASE
+#define UTS_RELEASE "5.10.247—WearyStars⭐"
+#elif defined(CONFIG_FAKE_UNAME_5_15)
+#undef UTS_RELEASE
+#define UTS_RELEASE "5.15.200—WearyStars⭐"
+#elif defined(CONFIG_FAKE_UNAME_6_1)
+#undef UTS_RELEASE
+#define UTS_RELEASE "6.1.200—WearyStars⭐"
+#elif defined(CONFIG_FAKE_UNAME_6_6)
+#undef UTS_RELEASE
+#define UTS_RELEASE "6.6.200—WearyStars⭐"
+#elif defined(CONFIG_FAKE_UNAME_6_12)
+#undef UTS_RELEASE
+#define UTS_RELEASE "6.12.200—WearyStars⭐"
+#endif
+
 #ifndef CONFIG_KALLSYMS
 #define version(a) Version_ ## a
 #define version_string(a) version(a)
