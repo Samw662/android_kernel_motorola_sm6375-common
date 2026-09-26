@@ -472,8 +472,7 @@ static struct notifier_block vmpressure_notif = {
 	.priority = INT_MAX
 };
 
-/* Initialize Simple LMK when lmkd in Android writes to the minfree parameter */
-static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
+static int simple_lmk_start(void)
 {
 	static atomic_t init_done = ATOMIC_INIT(0);
 	struct task_struct *thread;
@@ -491,6 +490,11 @@ static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
 	return 0;
 }
 
+static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
+{
+	return simple_lmk_start();
+}
+
 static const struct kernel_param_ops simple_lmk_init_ops = {
 	.set = simple_lmk_init_set
 };
@@ -499,3 +503,6 @@ static const struct kernel_param_ops simple_lmk_init_ops = {
 #undef MODULE_PARAM_PREFIX
 #define MODULE_PARAM_PREFIX "lowmemorykiller."
 module_param_cb(minfree, &simple_lmk_init_ops, NULL, 0200);
+
+/* lmkd no longer writes minfree on modern Android. */
+late_initcall(simple_lmk_start);
