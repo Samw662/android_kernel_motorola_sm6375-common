@@ -347,8 +347,11 @@ static struct mm_struct *next_reap_victim(void)
 		if (!mm || test_bit(MMF_OOM_SKIP, &mm->flags))
 			continue;
 
-		/* Do a trylock so the reaper thread doesn't sleep */
-		if (!down_read_trylock(&mm->mmap_sem)) {
+		/*
+		 * Write-lock so we can't race the OOM reaper (which read-locks
+		 * the same mm) in __oom_reap_task_mm().
+		 */
+		if (!down_write_trylock(&mm->mmap_sem)) {
 			should_retry = true;
 			continue;
 		}
@@ -359,12 +362,13 @@ static struct mm_struct *next_reap_victim(void)
 		 * No mmgrab() is needed because the reclaim thread sets
 		 * MMF_OOM_VICTIM under task_lock() for the mm's task, which
 		 * guarantees that MMF_OOM_VICTIM is always set before the
-		 * victim mm can enter exit_mmap(). Therefore, an mmap read lock
-		 * is sufficient to keep the mm struct itself from being freed.
+		 * victim mm can enter exit_mmap(). Therefore the mmap_sem
+		 * write lock keeps the mm struct itself from being freed for
+		 * the duration of the reap.
 		 */
 		if (!test_bit(MMF_OOM_SKIP, &mm->flags))
 			break;
-		up_read(&mm->mmap_sem);
+		up_write(&mm->mmap_sem);
 	}
 
 	if (!mm) {
@@ -403,7 +407,7 @@ static void reap_victims(void)
 			clear_bit(MMF_OOM_VICTIM, &mm->flags);
 			set_bit(MMF_OOM_SKIP, &mm->flags);
 		}
-		up_read(&mm->mmap_sem);
+		up_write(&mm->mmap_sem);
 	}
 }
 
