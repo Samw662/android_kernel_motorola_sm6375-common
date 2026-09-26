@@ -19,6 +19,7 @@
 #include <linux/slab.h>
 #include <linux/swap.h>
 #include <linux/printk.h>
+#include <linux/notifier.h>
 #include <linux/vmpressure.h>
 
 /*
@@ -96,6 +97,24 @@ enum vmpressure_modes {
 	VMPRESSURE_LOCAL,
 	VMPRESSURE_NUM_MODES,
 };
+
+/* In-kernel memory pressure listeners (Simple LMK). */
+static BLOCKING_NOTIFIER_HEAD(vmpressure_notifier);
+
+int vmpressure_notifier_register(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&vmpressure_notifier, nb);
+}
+
+int vmpressure_notifier_unregister(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&vmpressure_notifier, nb);
+}
+
+static void vmpressure_notify(unsigned long pressure)
+{
+	blocking_notifier_call_chain(&vmpressure_notifier, pressure, NULL);
+}
 
 static const char * const vmpressure_str_levels[] = {
 	[VMPRESSURE_LOW] = "low",
@@ -208,6 +227,10 @@ static void vmpressure_work_fn(struct work_struct *work)
 	spin_unlock(&vmpr->sr_lock);
 
 	level = vmpressure_calc_level(scanned, reclaimed);
+
+	/* Report system-wide critical pressure to in-kernel listeners. */
+	if (level == VMPRESSURE_CRITICAL && vmpr == memcg_to_vmpressure(NULL))
+		vmpressure_notify(100);
 
 	do {
 		if (vmpressure_event(vmpr, level, ancestor, signalled))
