@@ -93,6 +93,16 @@ config ANDROID_SIMPLE_LMK_TIMEOUT_MSEC
 	  needed. After the specified timeout elapses, Simple LMK will stop
 	  waiting and make itself available to kill more processes.
 
+config ANDROID_SIMPLE_LMK_BOOT_DELAY_MSEC
+	int "Boot grace period before reclaim starts (milliseconds)"
+	range 0 600000
+	default 120000
+	help
+	  Simple LMK stays idle for this long after it starts, so it can't
+	  kill processes while the system is still booting. The pressure
+	  notifier can report bogus critical events during boot and there
+	  is nothing worth killing yet. Set to 0 to arm it immediately.
+
 endif
 
 endif # if ANDROID

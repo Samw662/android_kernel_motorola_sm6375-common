@@ -13,6 +13,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sort.h>
 #include <linux/vmpressure.h>
+#include <linux/workqueue.h>
 #include <uapi/linux/sched/types.h>
 
 /* The minimum number of pages to free per reclaim */
@@ -23,6 +24,9 @@
 
 /* Timeout in jiffies for each reclaim */
 #define RECLAIM_EXPIRES msecs_to_jiffies(CONFIG_ANDROID_SIMPLE_LMK_TIMEOUT_MSEC)
+
+/* Grace period before Simple LMK starts reacting to memory pressure */
+#define BOOT_DELAY msecs_to_jiffies(CONFIG_ANDROID_SIMPLE_LMK_BOOT_DELAY_MSEC)
 
 struct victim_info {
 	struct task_struct *tsk;
@@ -475,6 +479,14 @@ static struct notifier_block vmpressure_notif = {
 	.priority = INT_MAX
 };
 
+static struct delayed_work simple_lmk_arm_work;
+
+static void simple_lmk_arm(struct work_struct *work)
+{
+	if (vmpressure_notifier_register(&vmpressure_notif))
+		pr_err("Failed to register vmpressure notifier\n");
+}
+
 static int simple_lmk_start(void)
 {
 	static atomic_t init_done = ATOMIC_INIT(0);
@@ -487,7 +499,15 @@ static int simple_lmk_start(void)
 		thread = kthread_run(simple_lmk_reclaim_thread, NULL,
 				     "simple_lmkd");
 		BUG_ON(IS_ERR(thread));
-		BUG_ON(vmpressure_notifier_register(&vmpressure_notif));
+
+		/*
+		 * Don't start reacting to pressure until userspace has come
+		 * up. The callback can report bogus critical events during
+		 * boot, and there's nothing worth killing yet anyway. The OOM
+		 * killer covers the boot.
+		 */
+		INIT_DELAYED_WORK(&simple_lmk_arm_work, simple_lmk_arm);
+		schedule_delayed_work(&simple_lmk_arm_work, BOOT_DELAY);
 	}
 
 	return 0;
