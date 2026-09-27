@@ -47,12 +47,10 @@ static __always_inline void update_lru_size(struct lruvec *lruvec,
 #endif
 }
 
-#ifdef CONFIG_LRU_GEN
 static inline bool lru_gen_enabled(void);
 static inline bool lru_gen_in_fault(void);
 static inline bool lru_gen_add_page(struct lruvec *lruvec, struct page *page, bool reclaiming);
 static inline bool lru_gen_del_page(struct lruvec *lruvec, struct page *page, bool reclaiming);
-#endif
 
 static __always_inline void add_page_to_lru_list(struct page *page,
 				struct lruvec *lruvec, enum lru_list lru)
