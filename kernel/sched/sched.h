@@ -2528,6 +2528,19 @@ static inline void double_rq_unlock(struct rq *rq1, struct rq *rq2)
 extern struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq);
 extern struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq);
 
+/* rq lock held, with curr outside the timeline at the call site. */
+extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
+extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
+
+static inline void init_entity_eevdf(struct sched_entity *se)
+{
+	/* Do not inherit lag or a request from a copied task_struct. */
+	se->vlag = 0;
+	/* No request is active until EEVDF placement is introduced. */
+	se->slice = 0;
+	se->deadline = 0;
+}
+
 #ifdef	CONFIG_SCHED_DEBUG
 extern bool sched_debug_enabled;
 

@@ -20,6 +20,8 @@
  *  Adaptive scheduling granularity, math enhancements by Peter Zijlstra
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
+#include <linux/math64.h>
+
 #include "sched.h"
 
 #include <trace/events/sched.h>
@@ -576,6 +578,56 @@ static void avg_vruntime_sub(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 	cfs_rq->avg_vruntime -= key * weight;
 	cfs_rq->avg_load -= weight;
+}
+
+/*
+ * The stored sums cover the timeline only. Include the runnable current
+ * entity once to obtain virtual time for the complete runnable set.
+ * Callers must hold the rq lock and observe curr outside the timeline.
+ */
+u64 avg_vruntime(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+	s64 avg = cfs_rq->avg_vruntime;
+	s64 load = cfs_rq->avg_load;
+
+	if (curr && curr->on_rq) {
+		unsigned long weight = scale_load_down(curr->load.weight);
+
+		avg += entity_key(cfs_rq, curr) * weight;
+		load += weight;
+	}
+
+	if (load) {
+		s64 quotient = div64_s64(avg, load);
+
+		/* Floor negative fractions without subtracting load - 1. */
+		if (avg < 0 && quotient * load != avg)
+			quotient--;
+		avg = quotient;
+	}
+
+	return cfs_rq->min_vruntime + avg;
+}
+
+/*
+ * Eligibility means vruntime <= V. Compare the weighted sums directly
+ * to avoid division and keep the same boundary as floor-rounded V.
+ */
+int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+	s64 avg = cfs_rq->avg_vruntime;
+	s64 load = cfs_rq->avg_load;
+
+	if (curr && curr->on_rq) {
+		unsigned long weight = scale_load_down(curr->load.weight);
+
+		avg += entity_key(cfs_rq, curr) * weight;
+		load += weight;
+	}
+
+	return avg >= entity_key(cfs_rq, se) * load;
 }
 
 static inline void avg_vruntime_update(struct cfs_rq *cfs_rq, s64 delta)
@@ -12197,6 +12249,8 @@ void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
 	/* se could be NULL for root_task_group */
 	if (!se)
 		return;
+
+	init_entity_eevdf(se);
 
 	if (!parent) {
 		se->cfs_rq = &rq->cfs;

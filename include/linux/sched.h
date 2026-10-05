@@ -526,9 +526,10 @@ struct sched_entity {
 	struct sched_avg		avg;
 #endif
 
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
+	/* EEVDF state; requests remain inactive while CFS drives scheduling. */
+	ANDROID_KABI_USE(1, s64 vlag);	/* virtual lag */
+	ANDROID_KABI_USE(2, u64 slice);	/* request duration in nanoseconds */
+	ANDROID_KABI_USE(3, u64 deadline);	/* virtual deadline */
 	ANDROID_KABI_RESERVE(4);
 };
 
