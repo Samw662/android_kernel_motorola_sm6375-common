@@ -792,6 +792,32 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 }
 
 /*
+ * Convert the physical request into weighted virtual time. The caller must
+ * first place vruntime in the target cfs_rq's absolute virtual-time domain.
+ * This does not start, renew or expire a request.
+ */
+u64 entity_virtual_deadline(struct sched_entity *se)
+{
+	return se->vruntime + calc_delta_fair(se->slice, se);
+}
+
+/*
+ * Save virtual lag while the entity still belongs to the runnable set.
+ * Join/leave operations can move V discontinuously, so bound the saved lag
+ * by two requests or one tick, converting that physical bound to virtual
+ * time with the same weight as the entity's vruntime accounting.
+ */
+static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	s64 lag, limit;
+
+	SCHED_WARN_ON(!se->on_rq);
+	lag = (s64)(avg_vruntime(cfs_rq) - se->vruntime);
+	limit = calc_delta_fair(max_t(u64, 2 * se->slice, TICK_NSEC), se);
+	se->vlag = clamp(lag, -limit, limit);
+}
+
+/*
  * The idea is to set a period in which each task runs once.
  *
  * When there are too many tasks (sched_nr_latency) we have to stretch
@@ -4450,6 +4476,12 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	update_stats_dequeue(cfs_rq, se, flags);
 
 	clear_buddies(cfs_rq, se);
+
+	/*
+	 * Snapshot before removal or CFS vruntime normalization, including
+	 * SAVE/RESTORE transactions. Restoring lag is not part of CFS enqueue.
+	 */
+	update_entity_lag(cfs_rq, se);
 
 	if (se != cfs_rq->curr)
 		__dequeue_entity(cfs_rq, se);

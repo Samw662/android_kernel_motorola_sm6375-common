@@ -2531,13 +2531,17 @@ extern struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq);
 /* rq lock held, with curr outside the timeline at the call site. */
 extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
 extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
+extern u64 entity_virtual_deadline(struct sched_entity *se);
+
+/* Initial upstream EEVDF request duration, in physical nanoseconds. */
+#define SCHED_BASE_SLICE	750000ULL
 
 static inline void init_entity_eevdf(struct sched_entity *se)
 {
 	/* Do not inherit lag or a request from a copied task_struct. */
 	se->vlag = 0;
-	/* No request is active until EEVDF placement is introduced. */
-	se->slice = 0;
+	se->slice = SCHED_BASE_SLICE;
+	/* A virtual deadline needs placement in the destination runqueue. */
 	se->deadline = 0;
 }
 
