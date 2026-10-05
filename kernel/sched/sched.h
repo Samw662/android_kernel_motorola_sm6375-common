@@ -623,6 +623,15 @@ struct cfs_rq {
 	unsigned int		h_nr_running;      /* SCHED_{NORMAL,BATCH,IDLE} */
 	unsigned int		idle_h_nr_running; /* SCHED_IDLE */
 
+	/*
+	 * Virtual-time accounting for entities in tasks_timeline only:
+	 * avg_vruntime = sum(weight * (vruntime - min_vruntime)),
+	 * avg_load = sum(weight), with weight = scale_load_down(load.weight).
+	 * The running entity is not included while it is outside the tree.
+	 */
+	s64			avg_vruntime;
+	u64			avg_load;
+
 	u64			exec_clock;
 	u64			min_vruntime;
 #ifndef CONFIG_64BIT
