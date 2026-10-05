@@ -807,14 +807,33 @@ u64 entity_virtual_deadline(struct sched_entity *se)
  * by two requests or one tick, converting that physical bound to virtual
  * time with the same weight as the entity's vruntime accounting.
  */
-static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+static s64 entity_lag(u64 avruntime, struct sched_entity *se)
 {
 	s64 lag, limit;
 
-	SCHED_WARN_ON(!se->on_rq);
-	lag = (s64)(avg_vruntime(cfs_rq) - se->vruntime);
+	lag = (s64)(avruntime - se->vruntime);
 	limit = calc_delta_fair(max_t(u64, 2 * se->slice, TICK_NSEC), se);
-	se->vlag = clamp(lag, -limit, limit);
+	return clamp(lag, -limit, limit);
+}
+
+static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	SCHED_WARN_ON(!se->on_rq);
+	se->vlag = entity_lag(avg_vruntime(cfs_rq), se);
+}
+
+/*
+ * Task weights and group shares fit in u32, including their fixed-point
+ * scaling. Use a wide intermediate: deadlines can be far behind vruntime
+ * while CFS still controls request expiration. Preserve signed truncation.
+ */
+static s64 reweight_virtual_time(s64 delta, unsigned long old_weight,
+				 unsigned long weight)
+{
+	u64 magnitude = delta < 0 ? -(u64)delta : (u64)delta;
+	u64 scaled = mul_u64_u32_div(magnitude, old_weight, weight);
+
+	return delta < 0 ? (s64)-scaled : (s64)scaled;
 }
 
 /*
@@ -3027,16 +3046,37 @@ dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) { }
 static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight, unsigned long runnable)
 {
+	bool curr = cfs_rq->curr == se;
+	u64 avruntime = 0;
+	unsigned long old_weight = se->load.weight;
+
 	if (se->on_rq) {
-		/* commit outstanding execution time */
-		if (cfs_rq->curr == se)
-			update_curr(cfs_rq);
-		else
-			avg_vruntime_sub(cfs_rq, se);
+		/* V must include all outstanding execution, also for !curr. */
+		update_curr(cfs_rq);
+		avruntime = avg_vruntime(cfs_rq);
+		if (!curr && weight != old_weight)
+			__dequeue_entity(cfs_rq, se);
 		account_entity_dequeue(cfs_rq, se);
 		dequeue_runnable_load_avg(cfs_rq, se);
 	}
 	dequeue_load_avg(cfs_rq, se);
+
+	if (weight != old_weight) {
+		if (se->on_rq) {
+			s64 lag = entity_lag(avruntime, se);
+			s64 deadline = (s64)(se->deadline - avruntime);
+
+			/* w * (V - v) is invariant; V is sampled before removal. */
+			se->vruntime = avruntime -
+				reweight_virtual_time(lag, old_weight, weight);
+			se->deadline = avruntime +
+				reweight_virtual_time(deadline, old_weight, weight);
+		} else {
+			/* SAVE/RESTORE and sleeping entities carry virtual lag. */
+			se->vlag = reweight_virtual_time(se->vlag,
+						 old_weight, weight);
+		}
+	}
 
 	se->runnable_weight = runnable;
 	update_load_set(&se->load, weight);
@@ -3055,20 +3095,30 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 	if (se->on_rq) {
 		account_entity_enqueue(cfs_rq, se);
 		enqueue_runnable_load_avg(cfs_rq, se);
-		if (cfs_rq->curr != se)
-			avg_vruntime_add(cfs_rq, se);
+		if (!curr && weight != old_weight)
+			__enqueue_entity(cfs_rq, se);
+		if (weight != old_weight)
+			update_min_vruntime(cfs_rq);
 	}
 }
 
 void reweight_task(struct task_struct *p, int prio)
 {
 	struct sched_entity *se = &p->se;
-	struct cfs_rq *cfs_rq = cfs_rq_of(se);
 	struct load_weight *load = &se->load;
-	unsigned long weight = scale_load(sched_prio_to_weight[prio]);
+	unsigned long weight = scale_load(task_has_idle_policy(p) ?
+					 WEIGHT_IDLEPRIO : sched_prio_to_weight[prio]);
 
-	reweight_entity(cfs_rq, se, weight, weight);
-	load->inv_weight = sched_prio_to_wmult[prio];
+	if (p->sched_class == &fair_sched_class) {
+		reweight_entity(cfs_rq_of(se), se, weight, weight);
+	} else {
+		/* Fair PELT state is detached while running in another class. */
+		se->vlag = reweight_virtual_time(se->vlag, load->weight, weight);
+		update_load_set(load, weight);
+		se->runnable_weight = weight;
+	}
+	load->inv_weight = task_has_idle_policy(p) ?
+		WMULT_IDLEPRIO : sched_prio_to_wmult[prio];
 }
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -4196,100 +4246,69 @@ static void check_spread(struct cfs_rq *cfs_rq, struct sched_entity *se)
 #endif
 }
 
-static inline bool entity_is_long_sleeper(struct sched_entity *se)
-{
-	struct cfs_rq *cfs_rq;
-	u64 sleep_time;
-
-	if (se->exec_start == 0)
-		return false;
-
-	cfs_rq = cfs_rq_of(se);
-
-	sleep_time = rq_clock_task(rq_of(cfs_rq));
-
-	/* Happen while migrating because of clock task divergence */
-	if (sleep_time <= se->exec_start)
-		return false;
-
-	sleep_time -= se->exec_start;
-	if (sleep_time > ((1ULL << 63) / scale_load_down(NICE_0_LOAD)))
-		return true;
-
-	return false;
-}
-
 static void
 place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 {
-	u64 vruntime = cfs_rq->min_vruntime;
+	struct sched_entity *curr = cfs_rq->curr;
+	u64 vruntime = avg_vruntime(cfs_rq);
+	s64 load = cfs_rq->avg_load;
+	s64 lag = 0;
+
+	se->slice = SCHED_BASE_SLICE;
+	if (curr && curr->on_rq)
+		load += scale_load_down(curr->load.weight);
 
 	/*
-	 * The 'current' period is already promised to the current tasks,
-	 * however the extra weight of the new task will slow them down a
-	 * little, place the new task so that it fits in the slot that
-	 * stays open at the end.
+	 * The entity is not yet runnable. Adding it changes V, so inflate
+	 * its saved virtual lag by (W + w) / W to preserve lag after joining.
+	 * An empty rq has no competing service against which to restore lag.
 	 */
+	if (!initial && load) {
+		lag = se->vlag;
+		/* l * (W + w) / W == l + l * w / W, without l * W. */
+		lag += div64_s64(lag * (s64)scale_load_down(se->load.weight),
+				 load);
+	}
+	se->vruntime = vruntime - lag;
+
+	/* Retain the CFS fork debit until the selector is converted. */
 	if (initial && sched_feat(START_DEBIT))
-		vruntime += sched_vslice(cfs_rq, se);
+		se->vruntime += sched_vslice(cfs_rq, se);
 
-	/* sleeps up to a single latency don't count. */
-	if (!initial) {
-		unsigned long thresh = sysctl_sched_latency;
+	se->deadline = entity_virtual_deadline(se);
+}
 
-		/*
-		 * Halve their sleep time's effect, to allow
-		 * for a gentler effect of sleepers:
-		 */
-		if (sched_feat(GENTLE_FAIR_SLEEPERS))
-			thresh >>= 1;
-
-		vruntime -= thresh;
 #ifdef CONFIG_SCHED_WALT
-		if (entity_is_task(se)) {
-			if (per_task_boost(task_of(se)) == TASK_BOOST_STRICT_MAX) {
-				vruntime -= thresh;
-				vruntime -= sysctl_sched_latency;
-				se->vruntime = vruntime;
-				return;
-			} else if (walt_binder_low_latency_task(task_of(se))) {
-				vruntime -= sysctl_sched_latency;
-				se->vruntime = vruntime;
-				return;
-			} else if (task_rtg_high_prio(task_of(se)) ||
-					walt_procfs_low_latency_task(task_of(se))) {
-				vruntime -= thresh;
-				se->vruntime = vruntime;
-				return;
-			}
-		}
-#endif
+/* Keep the vendor wakeup placement policy separate from lag restoration. */
+static void place_entity_walt(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	unsigned long thresh = sysctl_sched_latency;
+	u64 vruntime;
+
+	if (!entity_is_task(se))
+		return;
+
+	if (sched_feat(GENTLE_FAIR_SLEEPERS))
+		thresh >>= 1;
+	vruntime = cfs_rq->min_vruntime - thresh;
+
+	if (per_task_boost(task_of(se)) == TASK_BOOST_STRICT_MAX) {
+		vruntime -= thresh;
+		vruntime -= sysctl_sched_latency;
+	} else if (walt_binder_low_latency_task(task_of(se))) {
+		vruntime -= sysctl_sched_latency;
+	} else if (task_rtg_high_prio(task_of(se)) ||
+		   walt_procfs_low_latency_task(task_of(se))) {
+		vruntime -= thresh;
+	} else {
+		return;
 	}
 
-	/*
-	 * Pull vruntime of the entity being placed to the base level of
-	 * cfs_rq, to prevent boosting it if placed backwards.
-	 * However, min_vruntime can advance much faster than real time, with
-	 * the extreme being when an entity with the minimal weight always runs
-	 * on the cfs_rq. If the waking entity slept for a long time, its
-	 * vruntime difference from min_vruntime may overflow s64 and their
-	 * comparison may get inversed, so ignore the entity's original
-	 * vruntime in that case.
-	 * The maximal vruntime speedup is given by the ratio of normal to
-	 * minimal weight: scale_load_down(NICE_0_LOAD) / MIN_SHARES.
-	 * When placing a migrated waking entity, its exec_start has been set
-	 * from a different rq. In order to take into account a possible
-	 * divergence between new and prev rq's clocks task because of irq and
-	 * stolen time, we take an additional margin.
-	 * So, cutting off on the sleep time of
-	 *     2^63 / scale_load_down(NICE_0_LOAD) ~ 104 days
-	 * should be safe.
-	 */
-	if (entity_is_long_sleeper(se))
-		se->vruntime = vruntime;
-	else
-		se->vruntime = max_vruntime(se->vruntime, vruntime);
+	/* An explicit vendor boost overrides lag-preserving placement. */
+	se->vruntime = vruntime;
+	se->deadline = entity_virtual_deadline(se);
 }
+#endif
 
 static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
 
@@ -4316,58 +4335,23 @@ static inline void check_schedstat_required(void)
 static inline bool cfs_bandwidth_used(void);
 
 /*
- * MIGRATION
- *
- *	dequeue
- *	  update_curr()
- *	    update_min_vruntime()
- *	  vruntime -= min_vruntime
- *
- *	enqueue
- *	  update_curr()
- *	    update_min_vruntime()
- *	  vruntime += min_vruntime
- *
- * this way the vruntime transition between RQs is done when both
- * min_vruntime are up-to-date.
- *
- * WAKEUP (remote)
- *
- *	->migrate_task_rq_fair() (p->state == TASK_WAKING)
- *	  vruntime -= min_vruntime
- *
- *	enqueue
- *	  update_curr()
- *	    update_min_vruntime()
- *	  vruntime += min_vruntime
- *
- * this way we don't have the most up-to-date min_vruntime on the originating
- * CPU and an up-to-date min_vruntime on the destination CPU.
+ * All entities retain absolute vruntime while off-rq. Migration and wakeup
+ * restore saved lag against the destination's V; SAVE/RESTORE uses the same
+ * join operation, with DEQUEUE_SAVE keeping min_vruntime stable meanwhile.
  */
 
 static void
 enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
-	bool renorm = !(flags & ENQUEUE_WAKEUP) || (flags & ENQUEUE_MIGRATED);
 	bool curr = cfs_rq->curr == se;
+	unsigned long old_weight = se->load.weight;
+	u64 runtime = se->sum_exec_runtime;
 
-	/*
-	 * If we're the current task, we must renormalise before calling
-	 * update_curr().
-	 */
-	if (renorm && curr)
-		se->vruntime += cfs_rq->min_vruntime;
+	/* Restore an off-rq current entity before charging pending runtime. */
+	if (curr)
+		place_entity(cfs_rq, se, 0);
 
 	update_curr(cfs_rq);
-
-	/*
-	 * Otherwise, renormalise after, such that we're placed at the current
-	 * moment in time, instead of some random moment in the past. Being
-	 * placed in the past could significantly boost this task to the
-	 * fairness detriment of existing tasks.
-	 */
-	if (renorm && !curr)
-		se->vruntime += cfs_rq->min_vruntime;
 
 	/*
 	 * When enqueuing a sched_entity, we must:
@@ -4379,11 +4363,24 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 */
 	update_load_avg(cfs_rq, se, UPDATE_TG | DO_ATTACH);
 	update_cfs_group(se);
+	/* Reweight group entities before restoring lag with their new weight. */
+	if (!curr)
+		place_entity(cfs_rq, se, 0);
+	else if (old_weight != se->load.weight) {
+		/*
+		 * A current group was placed before update_curr(), using its
+		 * old weight. Restore the rescaled lag, then retain the service
+		 * charged above, converted with the new virtual time slope.
+		 */
+		place_entity(cfs_rq, se, 0);
+		se->vruntime += calc_delta_fair(se->sum_exec_runtime - runtime, se);
+	}
+#ifdef CONFIG_SCHED_WALT
+	if (flags & ENQUEUE_WAKEUP)
+		place_entity_walt(cfs_rq, se);
+#endif
 	enqueue_runnable_load_avg(cfs_rq, se);
 	account_entity_enqueue(cfs_rq, se);
-
-	if (flags & ENQUEUE_WAKEUP)
-		place_entity(cfs_rq, se, 0);
 	/* Entity has migrated, no longer consider this task hot */
 	if (flags & ENQUEUE_MIGRATED)
 		se->exec_start = 0;
@@ -4478,8 +4475,8 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	clear_buddies(cfs_rq, se);
 
 	/*
-	 * Snapshot before removal or CFS vruntime normalization, including
-	 * SAVE/RESTORE transactions. Restoring lag is not part of CFS enqueue.
+	 * Snapshot while V still includes this entity, also for temporary
+	 * SAVE/RESTORE transactions and migration. Enqueue restores this lag.
 	 */
 	update_entity_lag(cfs_rq, se);
 
@@ -4487,15 +4484,6 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		__dequeue_entity(cfs_rq, se);
 	se->on_rq = 0;
 	account_entity_dequeue(cfs_rq, se);
-
-	/*
-	 * Normalize after update_curr(); which will also have moved
-	 * min_vruntime if @se is the one holding it back. But before doing
-	 * update_min_vruntime() again, which will discount @se's position and
-	 * can move min_vruntime forward still more.
-	 */
-	if (!(flags & DEQUEUE_SLEEP))
-		se->vruntime -= cfs_rq->min_vruntime;
 
 	/* return excess runtime on last dequeue */
 	return_cfs_rq_runtime(cfs_rq);
@@ -7671,32 +7659,7 @@ static void detach_entity_cfs_rq(struct sched_entity *se);
  */
 static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 {
-	/*
-	 * As blocked tasks retain absolute vruntime the migration needs to
-	 * deal with this by subtracting the old and adding the new
-	 * min_vruntime -- the latter is done by enqueue_entity() when placing
-	 * the task on the new runqueue.
-	 */
-	if (p->state == TASK_WAKING) {
-		struct sched_entity *se = &p->se;
-		struct cfs_rq *cfs_rq = cfs_rq_of(se);
-		u64 min_vruntime;
-
-#ifndef CONFIG_64BIT
-		u64 min_vruntime_copy;
-
-		do {
-			min_vruntime_copy = cfs_rq->min_vruntime_copy;
-			smp_rmb();
-			min_vruntime = cfs_rq->min_vruntime;
-		} while (min_vruntime != min_vruntime_copy);
-#else
-		min_vruntime = cfs_rq->min_vruntime;
-#endif
-
-		se->vruntime -= min_vruntime;
-	}
-
+	/* Saved virtual lag is rq-independent; enqueue places it on new_cpu. */
 	if (p->on_rq == TASK_ON_RQ_MIGRATING) {
 		/*
 		 * In case of TASK_ON_RQ_MIGRATING we in fact hold the 'old'
@@ -11908,10 +11871,8 @@ static void task_fork_fair(struct task_struct *p)
 
 	cfs_rq = task_cfs_rq(current);
 	curr = cfs_rq->curr;
-	if (curr) {
+	if (curr)
 		update_curr(cfs_rq);
-		se->vruntime = curr->vruntime;
-	}
 	place_entity(cfs_rq, se, 1);
 
 	if (sysctl_sched_child_runs_first && curr && entity_before(curr, se)) {
@@ -11920,10 +11881,13 @@ static void task_fork_fair(struct task_struct *p)
 		 * 'current' within the tree based on its new key value.
 		 */
 		swap(curr->vruntime, se->vruntime);
+		curr->deadline = entity_virtual_deadline(curr);
 		resched_curr(rq);
 	}
 
-	se->vruntime -= cfs_rq->min_vruntime;
+	/* Fork balancing may enqueue the child on a different rq. */
+	se->vlag = entity_lag(avg_vruntime(cfs_rq), se);
+	se->deadline = entity_virtual_deadline(se);
 	rq_unlock(rq, &rf);
 }
 
@@ -11947,34 +11911,6 @@ prio_changed_fair(struct rq *rq, struct task_struct *p, int oldprio)
 			resched_curr(rq);
 	} else
 		check_preempt_curr(rq, p, 0);
-}
-
-static inline bool vruntime_normalized(struct task_struct *p)
-{
-	struct sched_entity *se = &p->se;
-
-	/*
-	 * In both the TASK_ON_RQ_QUEUED and TASK_ON_RQ_MIGRATING cases,
-	 * the dequeue_entity(.flags=0) will already have normalized the
-	 * vruntime.
-	 */
-	if (p->on_rq)
-		return true;
-
-	/*
-	 * When !on_rq, vruntime of the task has usually NOT been normalized.
-	 * But there are some cases where it has already been normalized:
-	 *
-	 * - A forked child which is waiting for being woken up by
-	 *   wake_up_new_task().
-	 * - A task which has been woken up by try_to_wake_up() and
-	 *   waiting for actually being woken up by sched_ttwu_pending().
-	 */
-	if (!se->sum_exec_runtime ||
-	    (p->state == TASK_WAKING && p->sched_remote_wakeup))
-		return true;
-
-	return false;
 }
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -12040,30 +11976,12 @@ static void attach_entity_cfs_rq(struct sched_entity *se)
 
 static void detach_task_cfs_rq(struct task_struct *p)
 {
-	struct sched_entity *se = &p->se;
-	struct cfs_rq *cfs_rq = cfs_rq_of(se);
-
-	if (!vruntime_normalized(p)) {
-		/*
-		 * Fix up our vruntime so that the current sleep doesn't
-		 * cause 'unlimited' sleep bonus.
-		 */
-		place_entity(cfs_rq, se, 0);
-		se->vruntime -= cfs_rq->min_vruntime;
-	}
-
-	detach_entity_cfs_rq(se);
+	detach_entity_cfs_rq(&p->se);
 }
 
 static void attach_task_cfs_rq(struct task_struct *p)
 {
-	struct sched_entity *se = &p->se;
-	struct cfs_rq *cfs_rq = cfs_rq_of(se);
-
-	attach_entity_cfs_rq(se);
-
-	if (!vruntime_normalized(p))
-		se->vruntime += cfs_rq->min_vruntime;
+	attach_entity_cfs_rq(&p->se);
 }
 
 static void switched_from_fair(struct rq *rq, struct task_struct *p)

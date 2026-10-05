@@ -772,6 +772,12 @@ static void set_load_weight(struct task_struct *p, bool update_load)
 	int prio = p->static_prio - MAX_RT_PRIO;
 	struct load_weight *load = &p->se.load;
 
+	/* Preserve saved fair lag across idle and scheduling-class changes. */
+	if (update_load) {
+		reweight_task(p, prio);
+		return;
+	}
+
 	/*
 	 * SCHED_IDLE tasks get minimal weight:
 	 */
@@ -782,17 +788,9 @@ static void set_load_weight(struct task_struct *p, bool update_load)
 		return;
 	}
 
-	/*
-	 * SCHED_OTHER tasks have to update their load when changing their
-	 * weight
-	 */
-	if (update_load && p->sched_class == &fair_sched_class) {
-		reweight_task(p, prio);
-	} else {
-		load->weight = scale_load(sched_prio_to_weight[prio]);
-		load->inv_weight = sched_prio_to_wmult[prio];
-		p->se.runnable_weight = load->weight;
-	}
+	load->weight = scale_load(sched_prio_to_weight[prio]);
+	load->inv_weight = sched_prio_to_wmult[prio];
+	p->se.runnable_weight = load->weight;
 }
 
 #ifdef CONFIG_UCLAMP_TASK
