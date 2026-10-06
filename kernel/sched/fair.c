@@ -21,6 +21,7 @@
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
 #include <linux/math64.h>
+#include <linux/rbtree_augmented.h>
 
 #include "sched.h"
 
@@ -681,8 +682,37 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
 #endif
 }
 
+static inline void __update_min_deadline(struct sched_entity *se,
+					struct rb_node *node)
+{
+	if (node) {
+		struct sched_entity *child;
+
+		child = rb_entry(node, struct sched_entity, run_node);
+		/* Virtual timestamps use signed differences across u64 wrap. */
+		if ((s64)(se->min_deadline - child->min_deadline) > 0)
+			se->min_deadline = child->min_deadline;
+	}
+}
+
+/* min_deadline = min(deadline, left->min_deadline, right->min_deadline). */
+static inline bool min_deadline_update(struct sched_entity *se, bool exit)
+{
+	u64 old_min_deadline = se->min_deadline;
+	struct rb_node *node = &se->run_node;
+
+	se->min_deadline = se->deadline;
+	__update_min_deadline(se, node->rb_right);
+	__update_min_deadline(se, node->rb_left);
+
+	return exit && se->min_deadline == old_min_deadline;
+}
+
+RB_DECLARE_CALLBACKS(static, min_deadline_cb, struct sched_entity,
+		     run_node, min_deadline, min_deadline_update);
+
 /*
- * Enqueue an entity into the rb-tree:
+ * Enqueue an entity into the rb-tree, still ordered by vruntime:
  */
 static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
@@ -692,6 +722,7 @@ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	bool leftmost = true;
 
 	avg_vruntime_add(cfs_rq, se);
+	se->min_deadline = se->deadline;
 
 	/*
 	 * Find the right place in the rbtree:
@@ -712,13 +743,17 @@ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	}
 
 	rb_link_node(&se->run_node, parent, link);
-	rb_insert_color_cached(&se->run_node,
-			       &cfs_rq->tasks_timeline, leftmost);
+	/* The leaf is already valid; propagate from its parent before rotations. */
+	min_deadline_cb.propagate(parent, NULL);
+	rb_insert_augmented_cached(&se->run_node,
+				   &cfs_rq->tasks_timeline, leftmost,
+				   &min_deadline_cb);
 }
 
 static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	rb_erase_cached(&se->run_node, &cfs_rq->tasks_timeline);
+	rb_erase_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
+				  &min_deadline_cb);
 	avg_vruntime_sub(cfs_rq, se);
 }
 

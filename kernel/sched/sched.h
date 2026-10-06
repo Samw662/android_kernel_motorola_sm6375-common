@@ -2543,6 +2543,7 @@ static inline void init_entity_eevdf(struct sched_entity *se)
 	se->slice = SCHED_BASE_SLICE;
 	/* A virtual deadline needs placement in the destination runqueue. */
 	se->deadline = 0;
+	se->min_deadline = 0;
 }
 
 #ifdef	CONFIG_SCHED_DEBUG
