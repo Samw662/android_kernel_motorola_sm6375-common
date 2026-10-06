@@ -853,12 +853,8 @@ pick_eevdf_tree(struct cfs_rq *cfs_rq, struct sched_entity *best)
 	return NULL;
 }
 
-/*
- * Passive selector: CFS remains the caller of pick_next_entity(). Before
- * activation, account curr's execution and renew any expired current request.
- * Do not substitute an ineligible leftmost entity if no candidate is found.
- */
-static struct sched_entity *__maybe_unused pick_eevdf(struct cfs_rq *cfs_rq)
+/* Account curr before selection; an ineligible leftmost task is no fallback. */
+static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
 
@@ -945,19 +941,24 @@ static bool renew_entity_request(struct sched_entity *se)
 	return true;
 }
 
-/*
- * Future callers must update_curr() first and act on request expiration
- * according to EEVDF policy. This helper neither reschedules nor changes
- * buddies; no active scheduling path calls it while CFS is in control.
- */
-static bool __maybe_unused update_curr_request(struct cfs_rq *cfs_rq)
+static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
+
+/* Renew after accounting; competing entities need a new selection opportunity. */
+static bool update_curr_request(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
 
 	if (!curr || !curr->on_rq)
 		return false;
 
-	return renew_entity_request(curr);
+	if (!renew_entity_request(curr))
+		return false;
+
+	if (cfs_rq->nr_running > 1) {
+		resched_curr(rq_of(cfs_rq));
+		clear_buddies(cfs_rq, curr);
+	}
+	return true;
 }
 
 /*
@@ -1168,8 +1169,11 @@ static void update_curr(struct cfs_rq *cfs_rq)
 		return;
 
 	delta_exec = now - curr->exec_start;
-	if (unlikely((s64)delta_exec <= 0))
+	if (unlikely((s64)delta_exec <= 0)) {
+		/* Placement/reweight can consume a request without new service. */
+		update_curr_request(cfs_rq);
 		return;
+	}
 
 	curr->exec_start = now;
 
@@ -1180,6 +1184,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	schedstat_add(cfs_rq->exec_clock, delta_exec);
 
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
+	update_curr_request(cfs_rq);
 	update_min_vruntime(cfs_rq);
 
 	if (entity_is_task(curr)) {
@@ -4662,7 +4667,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 /*
  * Preempt the current task with a newly woken task if needed:
  */
-static void
+static void __maybe_unused
 check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 {
 	unsigned long ideal_runtime, delta_exec;
@@ -4742,8 +4747,8 @@ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se);
  * 3) pick the "last" process, for cache locality
  * 4) do not run the "skip" process, if something else is available
  */
-static struct sched_entity *
-pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+static struct sched_entity *__maybe_unused
+pick_next_entity_cfs(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 {
 	struct sched_entity *left = __pick_first_entity(cfs_rq);
 	struct sched_entity *se;
@@ -4793,6 +4798,21 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 	return se;
 }
 
+static struct sched_entity *
+pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+{
+	struct sched_entity *se = pick_eevdf(cfs_rq);
+	struct sched_entity *next = cfs_rq->next;
+
+	/* A cache-locality hint may break a deadline tie, never eligibility. */
+	if (sched_feat(NEXT_BUDDY) && next && next->on_rq &&
+	    entity_eligible(cfs_rq, next) && next->deadline == se->deadline)
+		se = next;
+
+	clear_buddies(cfs_rq, se);
+	return se;
+}
+
 static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 
 static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
@@ -4832,6 +4852,8 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 	 */
 	update_load_avg(cfs_rq, curr, UPDATE_TG);
 	update_cfs_group(curr);
+	/* Group reweight may move vruntime past the adjusted deadline. */
+	update_curr_request(cfs_rq);
 
 #ifdef CONFIG_SCHED_HRTICK
 	/*
@@ -4850,8 +4872,7 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 		return;
 #endif
 
-	if (cfs_rq->nr_running > 1)
-		check_preempt_tick(cfs_rq, curr);
+	/* update_curr() renews expired requests and requests rescheduling. */
 }
 
 
@@ -5712,22 +5733,32 @@ static inline void unthrottle_offline_cfs_rqs(struct rq *rq) {}
 static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 {
 	struct sched_entity *se = &p->se;
-	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+	struct load_weight lw = { .weight = NICE_0_LOAD };
+	u64 delta = U64_MAX;
 
 	SCHED_WARN_ON(task_rq(p) != rq);
 
-	if (rq->cfs.h_nr_running > 1) {
-		u64 slice = sched_slice(cfs_rq, se);
-		u64 ran = se->sum_exec_runtime - se->prev_sum_exec_runtime;
-		s64 delta = slice - ran;
+	if (rq->cfs.h_nr_running <= 1)
+		return;
 
-		if (delta < 0) {
+	for_each_sched_entity(se) {
+		struct cfs_rq *cfs_rq = cfs_rq_of(se);
+		s64 remaining = (s64)(se->deadline - se->vruntime);
+
+		/* Only competing entities need a deadline-driven preemption. */
+		if (cfs_rq->nr_running <= 1)
+			continue;
+		if (remaining <= 0) {
 			if (rq->curr == p)
 				resched_curr(rq);
 			return;
 		}
-		hrtick_start(rq, delta);
+
+		/* Convert virtual service to physical time at each group level. */
+		delta = min(delta, __calc_delta(remaining, se->load.weight, &lw));
 	}
+	if (delta != U64_MAX)
+		hrtick_start(rq, delta);
 }
 
 /*
@@ -7933,7 +7964,7 @@ static void set_next_buddy(struct sched_entity *se)
 	}
 }
 
-static void set_skip_buddy(struct sched_entity *se)
+static void __maybe_unused set_skip_buddy(struct sched_entity *se)
 {
 	for_each_sched_entity(se)
 		cfs_rq_of(se)->skip = se;
@@ -7995,10 +8026,10 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	find_matching_se(&se, &pse);
 	update_curr(cfs_rq_of(se));
 	BUG_ON(!pse);
-	if (wakeup_preempt_entity(se, pse) == 1) {
+	if (pick_eevdf(cfs_rq_of(se)) != se) {
 		/*
-		 * Bias pick_next to pick the sched entity that is
-		 * triggering this preemption.
+		 * Retain the locality hint. It can affect selection only when
+		 * the wakee is eligible and ties the earliest deadline.
 		 */
 		if (!next_buddy_marked)
 			set_next_buddy(pse);
@@ -8184,9 +8215,8 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev)
 }
 
 /*
- * sched_yield() is very simple
- *
- * The magic of dealing with the ->skip buddy is in pick_next_entity.
+ * Yield the current request by postponing its deadline. A skip buddy cannot
+ * override EEVDF eligibility or earliest-deadline selection.
  */
 static void yield_task_fair(struct rq *rq)
 {
@@ -8202,21 +8232,12 @@ static void yield_task_fair(struct rq *rq)
 
 	clear_buddies(cfs_rq, se);
 
-	if (curr->policy != SCHED_BATCH) {
-		update_rq_clock(rq);
-		/*
-		 * Update run-time statistics of the 'current'.
-		 */
-		update_curr(cfs_rq);
-		/*
-		 * Tell update_rq_clock() that we've just updated,
-		 * so we don't do microscopic update in schedule()
-		 * and double the fastpath cost.
-		 */
-		rq_clock_skip_update(rq);
-	}
-
-	set_skip_buddy(se);
+	update_rq_clock(rq);
+	update_curr(cfs_rq);
+	rq_clock_skip_update(rq);
+	/* curr is outside the augmented timeline. */
+	se->deadline += calc_delta_fair(se->slice, se);
+	se->min_deadline = se->deadline;
 }
 
 static bool yield_to_task_fair(struct rq *rq, struct task_struct *p, bool preempt)
@@ -8225,6 +8246,8 @@ static bool yield_to_task_fair(struct rq *rq, struct task_struct *p, bool preemp
 
 	/* throttled hierarchies are not runnable */
 	if (!se->on_rq || throttled_hierarchy(cfs_rq_of(se)))
+		return false;
+	if (!entity_eligible(cfs_rq_of(se), se))
 		return false;
 
 	/* Tell the scheduler that we'd really like pse to run next. */
