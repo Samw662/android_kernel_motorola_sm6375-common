@@ -777,6 +777,97 @@ static struct sched_entity *__pick_next_entity(struct sched_entity *se)
 	return rb_entry(next, struct sched_entity, run_node);
 }
 
+static inline bool deadline_before(u64 a, u64 b)
+{
+	return (s64)(a - b) < 0;
+}
+
+/*
+ * The timeline is ordered by vruntime. Walk its eligibility boundary,
+ * retaining the best node and the fully eligible left subtree with the
+ * earliest min_deadline. Then descend that subtree to its minimum. Both
+ * walks follow a single tree path, giving O(log n) search.
+ *
+ * @best is the eligible current entity, which is outside the timeline.
+ * The rq lock must be held and the timeline's augmented data up to date.
+ */
+static struct sched_entity *
+pick_eevdf_tree(struct cfs_rq *cfs_rq, struct sched_entity *best)
+{
+	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
+	struct sched_entity *best_left = NULL;
+
+	while (node) {
+		struct sched_entity *se;
+
+		se = rb_entry(node, struct sched_entity, run_node);
+		if (!entity_eligible(cfs_rq, se)) {
+			/* This node and its entire right subtree are ineligible. */
+			node = node->rb_left;
+			continue;
+		}
+
+		if (!best || deadline_before(se->deadline, best->deadline))
+			best = se;
+
+		if (node->rb_left) {
+			struct sched_entity *left;
+
+			/* Every entity left of an eligible node is also eligible. */
+			left = rb_entry(node->rb_left, struct sched_entity, run_node);
+			if (!best_left || deadline_before(left->min_deadline,
+							best_left->min_deadline))
+				best_left = left;
+			if (left->min_deadline == se->min_deadline)
+				break;
+		}
+
+		if (se->deadline == se->min_deadline)
+			break;
+		node = node->rb_right;
+	}
+
+	if (!best_left || (best && deadline_before(best->deadline,
+						 best_left->min_deadline)))
+		return best;
+
+	/* All entities in this subtree are eligible; follow its deadline minimum. */
+	node = &best_left->run_node;
+	while (node) {
+		struct sched_entity *se;
+		struct sched_entity *left;
+
+		se = rb_entry(node, struct sched_entity, run_node);
+		if (se->deadline == se->min_deadline)
+			return se;
+		if (node->rb_left) {
+			left = rb_entry(node->rb_left, struct sched_entity, run_node);
+			if (left->min_deadline == se->min_deadline) {
+				node = node->rb_left;
+				continue;
+			}
+		}
+		node = node->rb_right;
+	}
+
+	return NULL;
+}
+
+/*
+ * Passive selector: CFS remains the caller of pick_next_entity(). Before
+ * activation, account curr's execution and renew any expired current request.
+ * Do not substitute an ineligible leftmost entity if no candidate is found.
+ */
+static struct sched_entity *__maybe_unused pick_eevdf(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+
+	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
+		curr = NULL;
+
+	return pick_eevdf_tree(cfs_rq, curr);
+}
+
 #ifdef CONFIG_SCHED_DEBUG
 struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
 {
@@ -834,6 +925,39 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 u64 entity_virtual_deadline(struct sched_entity *se)
 {
 	return se->vruntime + calc_delta_fair(se->slice, se);
+}
+
+/* Service and deadline are virtual timestamps, not physical nanoseconds. */
+static inline bool entity_request_expired(struct sched_entity *se)
+{
+	return !deadline_before(se->vruntime, se->deadline);
+}
+
+/* Called only for an entity outside the timeline, after execution accounting. */
+static bool renew_entity_request(struct sched_entity *se)
+{
+	if (!entity_request_expired(se))
+		return false;
+
+	se->slice = SCHED_BASE_SLICE;
+	se->deadline = entity_virtual_deadline(se);
+	se->min_deadline = se->deadline;
+	return true;
+}
+
+/*
+ * Future callers must update_curr() first and act on request expiration
+ * according to EEVDF policy. This helper neither reschedules nor changes
+ * buddies; no active scheduling path calls it while CFS is in control.
+ */
+static bool __maybe_unused update_curr_request(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+
+	if (!curr || !curr->on_rq)
+		return false;
+
+	return renew_entity_request(curr);
 }
 
 /*
