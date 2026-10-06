@@ -2532,6 +2532,7 @@ extern struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq);
 extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
 extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
 extern u64 entity_virtual_deadline(struct sched_entity *se);
+extern void init_task_fair_request(struct task_struct *p);
 
 /* Initial upstream EEVDF request duration, in physical nanoseconds. */
 #define SCHED_BASE_SLICE	750000ULL

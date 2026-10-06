@@ -7,8 +7,8 @@
 SCHED_FEAT(GENTLE_FAIR_SLEEPERS, true)
 
 /*
- * Place new tasks ahead so that they do not starve already running
- * tasks
+ * Legacy CFS initial service debit. EEVDF starts children at zero lag;
+ * retain the feature name for the sched_features interface.
  */
 SCHED_FEAT(START_DEBIT, true)
 

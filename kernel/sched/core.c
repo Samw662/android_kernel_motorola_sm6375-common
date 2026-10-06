@@ -4824,6 +4824,10 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 
 	p->prio = prio;
 
+	if (prev_class != &fair_sched_class &&
+	    p->sched_class == &fair_sched_class)
+		init_task_fair_request(p);
+
 	if (queued)
 		enqueue_task(rq, p, queue_flag);
 	if (running)
@@ -4888,14 +4892,17 @@ void set_user_nice(struct task_struct *p, long nice)
 	if (queued) {
 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
 		/*
-		 * If the task increased its priority or is running and
-		 * lowered its priority, then reschedule its CPU:
+		 * Keep the class's numeric-priority rule for a PI-boosted
+		 * non-fair task. Fair reevaluates EEVDF after set_next_task().
 		 */
-		if (delta < 0 || (delta > 0 && task_running(rq, p)))
+		if (p->sched_class != &fair_sched_class &&
+		    (delta < 0 || (delta > 0 && task_running(rq, p))))
 			resched_curr(rq);
 	}
 	if (running)
 		set_next_task(rq, p);
+	if (p->sched_class == &fair_sched_class)
+		p->sched_class->prio_changed(rq, p, old_prio);
 out_unlock:
 	task_rq_unlock(rq, p, &rf);
 }
@@ -5329,6 +5336,16 @@ change:
 	__setscheduler(rq, p, attr, pi);
 	__setscheduler_uclamp(p, attr);
 
+	/* Same-rq fair reweight already restored v and d against the old V. */
+	if (prev_class == &fair_sched_class &&
+	    p->sched_class == &fair_sched_class)
+		queue_flags &= ~ENQUEUE_MOVE;
+
+	/* Start the fair request before placement, not in switched_to(). */
+	if (prev_class != &fair_sched_class &&
+	    p->sched_class == &fair_sched_class)
+		init_task_fair_request(p);
+
 	if (queued) {
 		/*
 		 * We enqueue to tail when the priority of a task is
@@ -5343,6 +5360,10 @@ change:
 		set_next_task(rq, p);
 
 	check_class_changed(rq, p, prev_class, oldprio);
+	/* Same-priority policy changes can still change the fair candidate. */
+	if (prev_class == &fair_sched_class &&
+	    p->sched_class == &fair_sched_class && oldprio == p->prio)
+		p->sched_class->prio_changed(rq, p, oldprio);
 
 	/* Avoid rq from going away on us: */
 	preempt_disable();
