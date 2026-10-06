@@ -555,18 +555,37 @@ static inline int entity_before(struct sched_entity *a,
 
 static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	return (s64)(se->vruntime - cfs_rq->min_vruntime);
+	return (s64)(se->vruntime - cfs_rq->zero_vruntime);
 }
 
 /*
- * Track weighted virtual runtime relative to min_vruntime, rather than
- * multiplying absolute vruntime values. Scale weights down to further
- * reduce the size of the products. Only entities in the tree contribute.
+ * For O = zero_vruntime, keep A = sum_tree(w * (v - O)), W = sum_tree(w).
+ * Moving O by delta changes A by -W * delta; neither the exact average
+ * nor its division residue changes. curr is outside these stored sums.
+ * Unlike the legacy min_vruntime, O may move backwards with V.
  */
+static void rebase_vruntime(struct cfs_rq *cfs_rq, u64 origin)
+{
+	s64 delta = (s64)(origin - cfs_rq->zero_vruntime);
+
+	lockdep_assert_held(&rq_of(cfs_rq)->lock);
+	cfs_rq->avg_vruntime -= cfs_rq->avg_load * delta;
+	cfs_rq->zero_vruntime = origin;
+}
+
 static void avg_vruntime_add(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
+	struct sched_entity *curr = cfs_rq->curr;
 	unsigned long weight = scale_load_down(se->load.weight);
-	s64 key = entity_key(cfs_rq, se);
+	u64 load = cfs_rq->avg_load;
+	s64 key;
+
+	/* Avoid inflating a heavy join's product around the lighter old set. */
+	if (curr && curr->on_rq && curr != se)
+		load += scale_load_down(curr->load.weight);
+	if (weight > load)
+		rebase_vruntime(cfs_rq, se->vruntime);
+	key = entity_key(cfs_rq, se);
 
 	cfs_rq->avg_vruntime += key * weight;
 	cfs_rq->avg_load += weight;
@@ -624,12 +643,25 @@ static u64 __avg_vruntime(struct cfs_rq *cfs_rq, struct sched_entity *extra,
 	if (total)
 		*total = load;
 
-	return cfs_rq->min_vruntime + avg;
+	return cfs_rq->zero_vruntime + avg;
 }
 
 u64 avg_vruntime(struct cfs_rq *cfs_rq)
 {
+	lockdep_assert_held(&rq_of(cfs_rq)->lock);
 	return __avg_vruntime(cfs_rq, NULL, NULL, NULL);
+}
+
+/*
+ * Recenter only with a coherent tree/current set: full enqueue/dequeue,
+ * completed put_prev/reweight, and request expiration (including yield). In
+ * particular, do not average inside __{en,de}queue_entity(), where a
+ * put_prev/set_next transition can still have curr also in the tree.
+ * avg_vruntime() remains a pure reader, including for sched/debug.
+ */
+static void update_zero_vruntime(struct cfs_rq *cfs_rq)
+{
+	rebase_vruntime(cfs_rq, avg_vruntime(cfs_rq));
 }
 
 /*
@@ -652,21 +684,13 @@ int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	return avg >= entity_key(cfs_rq, se) * load;
 }
 
-static inline void avg_vruntime_update(struct cfs_rq *cfs_rq, s64 delta)
-{
-	/* Advancing the origin by delta subtracts delta from every key. */
-	cfs_rq->avg_vruntime -= cfs_rq->avg_load * delta;
-}
-
 static u64 __update_min_vruntime(struct cfs_rq *cfs_rq, u64 vruntime)
 {
 	u64 min_vruntime = cfs_rq->min_vruntime;
 	s64 delta = (s64)(vruntime - min_vruntime);
 
-	if (delta > 0) {
-		avg_vruntime_update(cfs_rq, delta);
+	if (delta > 0)
 		min_vruntime = vruntime;
-	}
 
 	return min_vruntime;
 }
@@ -987,6 +1011,9 @@ static bool update_curr_request(struct cfs_rq *cfs_rq)
 	if (!renew_entity_request(curr))
 		return false;
 
+	/* Single-entity execution and rapid yield must also pull the origin. */
+	update_zero_vruntime(cfs_rq);
+
 	if (cfs_rq->nr_running > 1) {
 		resched_curr(rq_of(cfs_rq));
 		clear_buddies(cfs_rq, curr);
@@ -996,16 +1023,17 @@ static bool update_curr_request(struct cfs_rq *cfs_rq)
 
 /*
  * Save virtual lag while the entity still belongs to the runnable set.
- * Join/leave operations can move V discontinuously, so bound the saved lag
- * by two requests or one tick, converting that physical bound to virtual
- * time with the same weight as the entity's vruntime accounting.
+ * Join/leave operations can move V discontinuously. All requests in this
+ * model have the same physical duration, so r_max is SCHED_BASE_SLICE.
+ * Allow one request plus tick quantization, then convert with this entity's
+ * weight. This bounds sleep snapshots, not administrative service debt.
  */
 static s64 entity_lag(u64 avruntime, struct sched_entity *se)
 {
 	s64 lag, limit;
 
 	lag = (s64)(avruntime - se->vruntime);
-	limit = calc_delta_fair(max_t(u64, 2 * se->slice, TICK_NSEC), se);
+	limit = calc_delta_fair(SCHED_BASE_SLICE + TICK_NSEC, se);
 	return clamp(lag, -limit, limit);
 }
 
@@ -3352,6 +3380,8 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 		if (weight != old_weight)
 			update_min_vruntime(cfs_rq);
 	}
+	if (weight != old_weight)
+		update_zero_vruntime(cfs_rq);
 }
 
 void reweight_task(struct task_struct *p, int prio)
@@ -4511,6 +4541,8 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	s64 load = cfs_rq->avg_load;
 	s64 lag = 0;
 
+	rebase_vruntime(cfs_rq, vruntime);
+
 	if (curr && curr->on_rq)
 		load += scale_load_down(curr->load.weight);
 
@@ -4548,38 +4580,6 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		se->deadline = se->vruntime + remaining;
 	}
 }
-
-#ifdef CONFIG_SCHED_WALT
-/* Keep the vendor wakeup placement policy separate from lag restoration. */
-static void place_entity_walt(struct cfs_rq *cfs_rq, struct sched_entity *se)
-{
-	unsigned long thresh = sysctl_sched_latency;
-	u64 vruntime;
-
-	if (!entity_is_task(se))
-		return;
-
-	if (sched_feat(GENTLE_FAIR_SLEEPERS))
-		thresh >>= 1;
-	vruntime = cfs_rq->min_vruntime - thresh;
-
-	if (per_task_boost(task_of(se)) == TASK_BOOST_STRICT_MAX) {
-		vruntime -= thresh;
-		vruntime -= sysctl_sched_latency;
-	} else if (walt_binder_low_latency_task(task_of(se))) {
-		vruntime -= sysctl_sched_latency;
-	} else if (task_rtg_high_prio(task_of(se)) ||
-		   walt_procfs_low_latency_task(task_of(se))) {
-		vruntime -= thresh;
-	} else {
-		return;
-	}
-
-	/* An explicit vendor boost overrides lag-preserving placement. */
-	se->deadline += vruntime - se->vruntime;
-	se->vruntime = vruntime;
-}
-#endif
 
 static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
 
@@ -4649,10 +4649,10 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		place_entity(cfs_rq, se, flags);
 		se->vruntime += calc_delta_fair(se->sum_exec_runtime - runtime, se);
 	}
-#ifdef CONFIG_SCHED_WALT
-	if (flags & ENQUEUE_WAKEUP)
-		place_entity_walt(cfs_rq, se);
-#endif
+	/*
+	 * WALT boost/RTG/Binder labels remain inputs to vendor placement and
+	 * tracking, but must not mint fair lag by moving vruntime on each wake.
+	 */
 	enqueue_runnable_load_avg(cfs_rq, se);
 	account_entity_enqueue(cfs_rq, se);
 	/* Entity has migrated, no longer consider this task hot */
@@ -4665,6 +4665,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	if (!curr)
 		__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;
+	update_zero_vruntime(cfs_rq);
 
 	/*
 	 * When bandwidth control is enabled, cfs might have been removed
@@ -4748,6 +4749,8 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	clear_buddies(cfs_rq, se);
 
+	/* Preserve the last V as the origin when the runnable set becomes empty. */
+	update_zero_vruntime(cfs_rq);
 	/*
 	 * Snapshot while V still includes this entity. Only real sleep bounds
 	 * the saved lag; administrative removal must not truncate service debt.
@@ -4775,6 +4778,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 */
 	if ((flags & (DEQUEUE_SAVE | DEQUEUE_MOVE)) != DEQUEUE_SAVE)
 		update_min_vruntime(cfs_rq);
+	update_zero_vruntime(cfs_rq);
 }
 
 /*
@@ -4950,6 +4954,8 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 		update_load_avg(cfs_rq, prev, 0);
 	}
 	cfs_rq->curr = NULL;
+	/* The heavy-join rebase above can move O without moving V. */
+	update_zero_vruntime(cfs_rq);
 }
 
 static void
@@ -4969,14 +4975,9 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 	update_curr_request(cfs_rq);
 
 #ifdef CONFIG_SCHED_HRTICK
-	/*
-	 * queued ticks are scheduled to match the slice, so don't bother
-	 * validating it and just reschedule.
-	 */
-	if (queued) {
-		resched_curr(rq_of(cfs_rq));
+	/* Expiration is decided by accounted service, not wall-clock expiry. */
+	if (queued)
 		return;
-	}
 	/*
 	 * don't let the period tick interfere with the hrtick preemption
 	 */
@@ -5843,6 +5844,13 @@ static inline void unthrottle_offline_cfs_rqs(struct rq *rq) {}
  */
 
 #ifdef CONFIG_SCHED_HRTICK
+static void hrtick_cancel_fair(struct rq *rq)
+{
+	/* A callback may be waiting for rq->lock; never wait for it here. */
+	if (hrtimer_active(&rq->hrtick_timer))
+		hrtimer_try_to_cancel(&rq->hrtick_timer);
+}
+
 static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 {
 	struct sched_entity *se = &p->se;
@@ -5851,8 +5859,11 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 
 	SCHED_WARN_ON(task_rq(p) != rq);
 
-	if (rq->cfs.h_nr_running <= 1)
+	if (!p->se.on_rq || rq->cfs.h_nr_running <= 1 ||
+	    (rq->curr == p && test_tsk_need_resched(p))) {
+		hrtick_cancel_fair(rq);
 		return;
+	}
 
 	for_each_sched_entity(se) {
 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
@@ -5862,8 +5873,13 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 		if (cfs_rq->nr_running <= 1)
 			continue;
 		if (remaining <= 0) {
-			if (rq->curr == p)
+			if (rq->curr == p) {
 				resched_curr(rq);
+				hrtick_cancel_fair(rq);
+			} else {
+				/* Account an overdue request once p actually runs. */
+				hrtick_start(rq, 0);
+			}
 			return;
 		}
 
@@ -5872,22 +5888,27 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 	}
 	if (delta != U64_MAX)
 		hrtick_start(rq, delta);
+	else
+		hrtick_cancel_fair(rq);
 }
 
 /*
- * called from enqueue/dequeue and updates the hrtick when the
- * current task is from our class and nr_running is low enough
- * to matter.
+ * Recompute the remaining request after changes to the runnable set or
+ * current weight. A stale remote arm can still deliver a callback; it
+ * revalidates service and competition instead of forcing preemption.
  */
 static void hrtick_update(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
 
-	if (!hrtick_enabled(rq) || curr->sched_class != &fair_sched_class)
+	if (curr->sched_class != &fair_sched_class)
 		return;
 
-	if (cfs_rq_of(&curr->se)->nr_running < sched_nr_latency)
-		hrtick_start_fair(rq, curr);
+	if (!hrtick_enabled(rq)) {
+		hrtick_cancel_fair(rq);
+		return;
+	}
+	hrtick_start_fair(rq, curr);
 }
 #else /* !CONFIG_SCHED_HRTICK */
 static inline void
@@ -8335,19 +8356,21 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev)
 }
 
 /*
- * Yield the current request by postponing its deadline. A skip buddy cannot
- * override EEVDF eligibility or earliest-deadline selection.
+ * Forfeit an eligible current entity's remaining request. Postponing only
+ * its deadline can repeatedly pick the sole eligible entity and accumulate
+ * arbitrarily distant deadlines. A skip buddy is not an EEVDF substitute.
  */
 static void yield_task_fair(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
 	struct cfs_rq *cfs_rq = task_cfs_rq(curr);
 	struct sched_entity *se = &curr->se;
+	u64 deadline = se->deadline;
 
 	/*
 	 * Are we the only task in the tree?
 	 */
-	if (unlikely(rq->nr_running == 1))
+	if (unlikely(cfs_rq->nr_running == 1))
 		return;
 
 	clear_buddies(cfs_rq, se);
@@ -8355,9 +8378,16 @@ static void yield_task_fair(struct rq *rq)
 	update_rq_clock(rq);
 	update_curr(cfs_rq);
 	rq_clock_skip_update(rq);
-	/* curr is outside the augmented timeline. */
-	se->deadline += calc_delta_fair(se->slice, se);
-	se->min_deadline = se->deadline;
+	/*
+	 * An expired request was already renewed by update_curr(): do not
+	 * forfeit that new request too. curr is outside the augmented tree;
+	 * an ineligible entity must not accumulate further service debt.
+	 */
+	if (se->deadline == deadline && entity_eligible(cfs_rq, se)) {
+		se->vruntime = se->deadline;
+		update_curr_request(cfs_rq);
+		update_min_vruntime(cfs_rq);
+	}
 }
 
 static bool yield_to_task_fair(struct rq *rq, struct task_struct *p, bool preempt)
@@ -12139,6 +12169,12 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 		entity_tick(cfs_rq, se, queued);
 	}
 
+#ifdef CONFIG_SCHED_HRTICK
+	/* IRQ/other-class time can make a wall-clock hrtick arrive early. */
+	if (queued)
+		hrtick_update(rq);
+#endif
+
 	if (static_branch_unlikely(&sched_numa_balancing))
 		task_tick_numa(rq, curr);
 
@@ -12328,6 +12364,7 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
 		account_cfs_rq_runtime(cfs_rq, 0);
 	}
 	check_preempt_changed_fair(rq);
+	hrtick_update(rq);
 }
 
 void init_cfs_rq(struct cfs_rq *cfs_rq)
@@ -12336,6 +12373,7 @@ void init_cfs_rq(struct cfs_rq *cfs_rq)
 	cfs_rq->avg_vruntime = 0;
 	cfs_rq->avg_load = 0;
 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
+	cfs_rq->zero_vruntime = cfs_rq->min_vruntime;
 #ifndef CONFIG_64BIT
 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
 #endif
